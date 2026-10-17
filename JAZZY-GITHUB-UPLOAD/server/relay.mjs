@@ -2,6 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import {readFileSync} from 'node:fs';
 import {createAccounts} from './accounts.mjs';
+import {createFriends} from './friends.mjs';
 
 const hash = s => createHash('sha256').update(s).digest('hex');
 const same = (a,b) => typeof a==='string' && typeof b==='string' && Buffer.byteLength(a)===Buffer.byteLength(b) && timingSafeEqual(Buffer.from(a),Buffer.from(b));
@@ -19,6 +20,7 @@ export function createRelay({database=':memory:',setupToken,allowDevelopment=fal
     CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT,room TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,id TEXT NOT NULL,author TEXT NOT NULL,created TEXT NOT NULL,iv TEXT NOT NULL,ciphertext TEXT NOT NULL,bytes INTEGER NOT NULL,UNIQUE(room,id));
     CREATE INDEX IF NOT EXISTS event_room ON events(room,seq);`);
   const accounts=createAccounts(db,initialAccounts,now);
+  const friends=createFriends({db,accounts,setupToken,now,requireThat});
   const buckets = new Map();
   function rate(key,max=180) {
     const minute=Math.floor(now()/60000);
@@ -59,7 +61,7 @@ export function createRelay({database=':memory:',setupToken,allowDevelopment=fal
       requireThat(!origin||allowed,403,'Origin not allowed.');
       if(request.method==='OPTIONS') return new Response(null,{status:204,headers});
       const url=new URL(request.url);
-      if(request.method==='GET' && url.pathname==='/health') return response({ok:true,app:'JAZZY',protocol:1});
+      if(request.method==='GET' && url.pathname==='/health') return response({ok:true,app:'JAZZY',protocol:2,features:['username-friends']});
       rate(remoteAddress);
       if(request.method==='POST'&&url.pathname==='/v1/auth/login'){
         rate(remoteAddress+':login',10);
@@ -79,16 +81,18 @@ export function createRelay({database=':memory:',setupToken,allowDevelopment=fal
         accounts.logout(request.headers.get('x-jazzy-session'));
         return response({ok:true});
       }
-      if(request.method==='POST' && url.pathname==='/v1/rooms') {
+      const friendResponse=await friends.handle(request,url,body,response);if(friendResponse)return friendResponse;
+      if(request.method==='POST' && ['/v1/rooms','/v2/rooms'].includes(url.pathname)) {
         rate(remoteAddress+':setup',8);
-        requireThat(same(request.headers.get('authorization')||'','Bearer '+setupToken),401,'The server setup key is incorrect.');
+        if(url.pathname==='/v2/rooms')friends.device(request);
+        else requireThat(same(request.headers.get('authorization')||'','Bearer '+setupToken),401,'The server setup key is incorrect.');
         const b=await body(request,4096);
         const account=accounts.session(request.headers.get('x-jazzy-session'));
         requireThat(account&&account.role===b.role,401,'Log in to your own account before creating your space.');
         requireThat(roomId(b.room)&&token(b.token)&&token(b.join)&&['hyu','jasmin'].includes(b.role),400,'Invalid pairing request.');
         const existing=db.prepare('SELECT * FROM rooms WHERE id=?').get(b.room);
         if(existing){requireThat(same(existing.owner_hash,hash(b.token)),409,'Pair already exists.');return response({room:b.room,role:existing.owner});}
-        requireThat(db.prepare('SELECT count(*) AS n FROM rooms').get().n===0,409,'This server already has a pair. Use your partner’s invite.');
+        requireThat(db.prepare('SELECT count(*) AS n FROM rooms').get().n===0,409,'Your partner already created the space. Open Friends and accept their request.');
         db.prepare('INSERT INTO rooms(id,owner,owner_hash,join_hash,join_expires,created) VALUES (?,?,?,?,?,?)').run(b.room,b.role,hash(b.token),hash(b.join),now()+72*3600000,now());
         return response({room:b.room,role:b.role},201);
       }
